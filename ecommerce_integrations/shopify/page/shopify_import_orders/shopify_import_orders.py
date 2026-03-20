@@ -13,6 +13,7 @@ from ecommerce_integrations.shopify.utils import create_shopify_log
 SYNC_JOB_NAME = "shopify.job.sync.all.orders"
 REALTIME_KEY = "shopify.key.sync.all.orders"
 SYNC_PROGRESS_KEY = "shopify_sync_all_progress"
+SYNC_BATCH_SIZE = 8
 
 
 @frappe.whitelist()
@@ -201,27 +202,46 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 		expires_in_sec=14400,
 	)
 
-	publish(f"Dispatching {total} orders for parallel sync...", dispatched=total)
+	publish(f"Syncing {total} orders ({SYNC_BATCH_SIZE} at a time)...", dispatched=total)
 
-	# Enqueue each order as a separate background job for parallel processing.
-	# RQ workers will pick these up concurrently, limited by worker count.
-	for order_dict in orders_to_sync:
-		log = create_shopify_log(
-			status="Queued",
-			method="ecommerce_integrations.shopify.order.sync_sales_order",
-			request_data=order_dict,
-			make_new=True,
-		)
-		frappe.enqueue(
-			_sync_order_worker,
-			queue="short",
-			timeout=300,
-			order_dict=order_dict,
-			request_id=log.name,
-		)
+	# Process orders in controlled batches to avoid overwhelming the server.
+	# Each batch enqueues SYNC_BATCH_SIZE orders as parallel background jobs,
+	# then waits for them to complete before dispatching the next batch.
+	for i in range(0, total, SYNC_BATCH_SIZE):
+		batch = orders_to_sync[i : i + SYNC_BATCH_SIZE]
 
-	frappe.db.commit()
+		for order_dict in batch:
+			log = create_shopify_log(
+				status="Queued",
+				method="ecommerce_integrations.shopify.order.sync_sales_order",
+				request_data=order_dict,
+				make_new=True,
+			)
+			frappe.enqueue(
+				_sync_order_worker,
+				queue="short",
+				timeout=300,
+				order_dict=order_dict,
+				request_id=log.name,
+			)
+
+		frappe.db.commit()
+		_wait_for_batch(expected_done=i + len(batch))
+
+	elapsed = time.time() - start_time
+	publish(f"Done in {elapsed:.1f}s", done=True)
+	frappe.cache.delete_value(SYNC_PROGRESS_KEY)
 	return True
+
+
+def _wait_for_batch(expected_done, timeout=600):
+	"""Poll the cache counter until the batch completes or timeout is reached."""
+	deadline = time.time() + timeout
+	while time.time() < deadline:
+		progress = frappe.cache.get_value(SYNC_PROGRESS_KEY)
+		if progress and progress.get("done", 0) >= expected_done:
+			return
+		time.sleep(1)
 
 
 def _sync_order_worker(order_dict, request_id):
@@ -234,18 +254,11 @@ def _sync_order_worker(order_dict, request_id):
 	except Exception as e:
 		publish(f"Error syncing Order {order_name}: {e!s}", error=True)
 
-	# Update progress and check if this was the last order
+	# Increment done counter so the coordinator knows this batch is progressing
 	progress = frappe.cache.get_value(SYNC_PROGRESS_KEY)
 	if progress:
 		progress["done"] = progress.get("done", 0) + 1
-		done = progress["done"]
-		total = progress["total"]
 		frappe.cache.set_value(SYNC_PROGRESS_KEY, progress, expires_in_sec=14400)
-
-		if done >= total:
-			elapsed = time.time() - progress.get("start_time", time.time())
-			publish(f"Done in {elapsed:.1f}s", done=True)
-			frappe.cache.delete_value(SYNC_PROGRESS_KEY)
 
 
 def publish(message, synced=False, error=False, done=False, dispatched=0, br=True):
