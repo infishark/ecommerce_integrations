@@ -1,4 +1,4 @@
-from time import process_time
+import time
 
 import frappe
 from frappe.utils import cstr, get_datetime
@@ -12,6 +12,7 @@ from ecommerce_integrations.shopify.utils import create_shopify_log
 # constants
 SYNC_JOB_NAME = "shopify.job.sync.all.orders"
 REALTIME_KEY = "shopify.key.sync.all.orders"
+SYNC_PROGRESS_KEY = "shopify_sync_all_progress"
 
 
 @frappe.whitelist()
@@ -129,6 +130,12 @@ def is_order_synced(order_id):
 
 
 @frappe.whitelist()
+def is_sync_running():
+	"""Check if a sync-all operation is currently in progress."""
+	return bool(frappe.cache.get_value(SYNC_PROGRESS_KEY))
+
+
+@frappe.whitelist()
 def import_all_orders(created_at_min=None, created_at_max=None):
 	frappe.enqueue(
 		queue_sync_all_orders,
@@ -141,59 +148,107 @@ def import_all_orders(created_at_min=None, created_at_max=None):
 
 
 def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
-	start_time = process_time()
+	start_time = time.time()
 
-	publish("Syncing all orders...")
+	publish("Fetching orders from Shopify...")
 
-	_sync = True
+	# Batch-fetch all synced Shopify order IDs in a single query
+	synced_ids = set(
+		frappe.db.sql_list(
+			f"""SELECT `{ORDER_ID_FIELD}` FROM `tabSales Order`
+			WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''"""
+		)
+	)
+
+	# Fetch from Shopify in large batches (250 = Shopify API max)
+	orders_to_sync = []
+	skipped = 0
 	collection = _fetch_orders_from_shopify(
 		created_at_min=created_at_min,
 		created_at_max=created_at_max,
-		limit=50,
+		limit=250,
 	)
-	savepoint = "shopify_order_sync"
 
-	while _sync:
+	_fetching = True
+	while _fetching:
 		for order in collection:
 			order_dict = order.to_dict()
-			order_id = order_dict.get("id")
-			order_name = order_dict.get("name", order_id)
-
-			try:
-				publish(f"Processing order {order_name}", br=False)
-				frappe.db.savepoint(savepoint)
-
-				if is_order_synced(order_id):
-					publish(f"Order {order_name} already synced. Skipping...")
-					continue
-
-				log = create_shopify_log(
-					status="Queued",
-					method="ecommerce_integrations.shopify.order.sync_sales_order",
-					request_data=order_dict,
-					make_new=True,
-				)
-				sync_sales_order(order_dict, request_id=log.name)
-
-				publish(f"Synced Order {order_name}", synced=True)
-
-			except Exception as e:
-				publish(f"Error Syncing Order {order_name} : {e!s}", error=True)
-				frappe.db.rollback(save_point=savepoint)
+			if str(order_dict.get("id")) in synced_ids:
+				skipped += 1
 				continue
+			orders_to_sync.append(order_dict)
 
 		if collection.has_next_page():
-			frappe.db.commit()
 			collection = _fetch_orders_from_shopify(from_=collection.next_page_url)
 		else:
-			_sync = False
+			_fetching = False
 
-	end_time = process_time()
-	publish(f"Done in {end_time - start_time:.1f}s", done=True)
+	total = len(orders_to_sync)
+	if total == 0:
+		msg = "No new orders to sync."
+		if skipped:
+			msg = f"All {skipped} orders already synced."
+		publish(msg, done=True)
+		return True
+
+	if skipped:
+		publish(f"Skipped {skipped} already-synced orders.")
+
+	# Store progress in cache (auto-expires in 4 hours as a safety net)
+	frappe.cache.set_value(
+		SYNC_PROGRESS_KEY,
+		{"total": total, "done": 0, "start_time": start_time},
+		expires_in_sec=14400,
+	)
+
+	publish(f"Dispatching {total} orders for parallel sync...", dispatched=total)
+
+	# Enqueue each order as a separate background job for parallel processing.
+	# RQ workers will pick these up concurrently, limited by worker count.
+	for order_dict in orders_to_sync:
+		log = create_shopify_log(
+			status="Queued",
+			method="ecommerce_integrations.shopify.order.sync_sales_order",
+			request_data=order_dict,
+			make_new=True,
+		)
+		frappe.enqueue(
+			_sync_order_worker,
+			queue="short",
+			timeout=300,
+			order_dict=order_dict,
+			request_id=log.name,
+		)
+
+	frappe.db.commit()
 	return True
 
 
-def publish(message, synced=False, error=False, done=False, br=True):
+def _sync_order_worker(order_dict, request_id):
+	"""Process a single Shopify order and report progress."""
+	order_name = order_dict.get("name", order_dict.get("id"))
+
+	try:
+		sync_sales_order(order_dict, request_id=request_id)
+		publish(f"Synced Order {order_name}", synced=True)
+	except Exception as e:
+		publish(f"Error syncing Order {order_name}: {e!s}", error=True)
+
+	# Update progress and check if this was the last order
+	progress = frappe.cache.get_value(SYNC_PROGRESS_KEY)
+	if progress:
+		progress["done"] = progress.get("done", 0) + 1
+		done = progress["done"]
+		total = progress["total"]
+		frappe.cache.set_value(SYNC_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+		if done >= total:
+			elapsed = time.time() - progress.get("start_time", time.time())
+			publish(f"Done in {elapsed:.1f}s", done=True)
+			frappe.cache.delete_value(SYNC_PROGRESS_KEY)
+
+
+def publish(message, synced=False, error=False, done=False, dispatched=0, br=True):
 	frappe.publish_realtime(
 		REALTIME_KEY,
 		{
@@ -201,5 +256,6 @@ def publish(message, synced=False, error=False, done=False, br=True):
 			"error": error,
 			"message": message + ("<br /><br />" if br else ""),
 			"done": done,
+			"dispatched": dispatched,
 		},
 	)

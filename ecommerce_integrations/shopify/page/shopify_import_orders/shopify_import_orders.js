@@ -29,13 +29,10 @@ shopify.OrderImporter = class {
 	}
 
 	async checkSyncStatus() {
-		const jobs = await frappe.db.get_list("RQ Job", {
-			filters: { status: ("in", ("queued", "started")) },
+		const { message: running } = await frappe.call({
+			method: "ecommerce_integrations.shopify.page.shopify_import_orders.shopify_import_orders.is_sync_running",
 		});
-		this.syncRunning =
-			jobs.find(
-				(job) => job.job_name === "shopify.job.sync.all.orders",
-			) !== undefined;
+		this.syncRunning = running;
 
 		if (this.syncRunning) {
 			this.toggleSyncAllButton();
@@ -396,17 +393,24 @@ shopify.OrderImporter = class {
 		const _syncedCounter = $("#count-orders-synced");
 		const _erpnextCounter = $("#count-orders-erpnext");
 
+		let dispatched = 0;
+		let completed = 0;
+
 		frappe.realtime.on(
 			"shopify.key.sync.all.orders",
-			({ message, synced, done, error }) => {
+			({ message, synced, done, error, dispatched: d }) => {
 				message = `<pre class="mb-0">${message}</pre>`;
 				_log.append(message);
 				_log.scrollTop(_log[0].scrollHeight);
 
-				if (synced)
+				if (d) dispatched = d;
+				if (synced) {
+					completed++;
 					this.updateSyncedCount(_syncedCounter, _erpnextCounter);
+				}
+				if (error) completed++;
 
-				if (done) {
+				if (done || (dispatched > 0 && completed >= dispatched)) {
 					frappe.realtime.off("shopify.key.sync.all.orders");
 					this.toggleSyncAllButton(false);
 					this.fetchOrderCount();
