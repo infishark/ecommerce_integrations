@@ -26,7 +26,8 @@ class ShopifyCustomer(EcommerceCustomer):
 			customer_name = customer.get("email")
 
 		customer_group = self.setting.customer_group
-		super().sync_customer(customer_name, customer_group)
+		company_currency = frappe.get_cached_value("Company", self.setting.company, "default_currency")
+		super().sync_customer(customer_name, customer_group, default_currency=company_currency)
 
 		billing_address = customer.get("billing_address", {}) or customer.get("default_address")
 		shipping_address = customer.get("shipping_address", {})
