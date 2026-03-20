@@ -33,6 +33,8 @@
   "sync_sales_invoice",
   "add_shipping_as_item",
   "consolidate_taxes",
+  "country_warehouse_mapping_section",
+  "country_warehouse_mapping",
   "section_break_22",
   "html_16",
   "taxes",
@@ -366,6 +368,18 @@
    "label": "Consolidate Taxes in Order"
   },
   {
+   "fieldname": "country_warehouse_mapping_section",
+   "fieldtype": "Section Break",
+   "label": "Country Warehouse Mapping",
+   "description": "Map shipping countries to specific warehouses. Orders shipping to a listed country will use the mapped warehouse instead of the default."
+  },
+  {
+   "fieldname": "country_warehouse_mapping",
+   "fieldtype": "Table",
+   "label": "Country Warehouse Mapping",
+   "options": "Shopify Country Warehouse Mapping"
+  },
+  {
    "description": "When no sales tax mapping is found this tax account will be used as the default account. This is only applied for Sales Tax. Any shipping related charges still need to be mapped separately.",
    "fieldname": "default_sales_tax_account",
    "fieldtype": "Link",
@@ -392,7 +406,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2023-10-24 10:38:49.247431",
+ "modified": "2026-03-20 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "Shopify Setting",

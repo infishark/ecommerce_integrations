@@ -93,14 +93,14 @@ def create_sales_order(shopify_order, setting, company=None):
 	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
 
 	if not so:
-		item_warehouse_map = _build_item_warehouse_map(shopify_order, setting)
+		warehouse = _resolve_order_warehouse(shopify_order, setting)
 
 		items = get_order_items(
 			shopify_order.get("line_items"),
 			setting,
 			getdate(shopify_order.get("created_at")),
 			taxes_inclusive=shopify_order.get("taxes_included"),
-			item_warehouse_map=item_warehouse_map,
+			warehouse=warehouse,
 		)
 
 		if not items:
@@ -163,10 +163,12 @@ def create_sales_order(shopify_order, setting, company=None):
 	return so
 
 
-def get_order_items(order_items, setting, delivery_date, taxes_inclusive, item_warehouse_map=None):
+def get_order_items(order_items, setting, delivery_date, taxes_inclusive, warehouse=None):
 	items = []
 	all_product_exists = True
 	product_not_exists = []
+
+	warehouse = warehouse or setting.warehouse
 
 	for shopify_item in order_items:
 		if not shopify_item.get("product_exists"):
@@ -178,7 +180,6 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, item_w
 
 		if all_product_exists:
 			item_code = get_item_code(shopify_item)
-			warehouse = _resolve_item_warehouse(shopify_item, setting, item_warehouse_map)
 			items.append(
 				{
 					"item_code": item_code,
@@ -199,44 +200,19 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, item_w
 	return items
 
 
-def _build_item_warehouse_map(shopify_order, setting):
-	"""Build a mapping of (product_id, variant_id) → ERPNext warehouse from fulfillment data.
+def _resolve_order_warehouse(shopify_order, setting):
+	"""Resolve the ERPNext warehouse for a Shopify order based on shipping country.
 
-	Uses the Shopify Warehouse Mapping configured in Shopify Setting to resolve
-	each fulfillment location to an ERPNext warehouse.  Returns an empty dict if
-	there are no fulfillments or no mappings configured.
+	Looks up the order's shipping country in the Country Warehouse Mapping
+	table on Shopify Setting.  Falls back to the default warehouse.
 	"""
-	fulfillments = shopify_order.get("fulfillments") or []
-	if not fulfillments:
-		return {}
+	shipping_address = shopify_order.get("shipping_address") or {}
+	shipping_country = shipping_address.get("country")
 
-	wh_map = setting.get_integration_to_erpnext_wh_mapping()
-	if not wh_map:
-		return {}
-
-	item_warehouse = {}
-	for fulfillment in fulfillments:
-		location_id = str(fulfillment.get("location_id") or "")
-		warehouse = wh_map.get(location_id)
-		if warehouse:
-			for item in fulfillment.get("line_items") or []:
-				key = (str(item.get("product_id")), str(item.get("variant_id")))
-				item_warehouse[key] = warehouse
-
-	return item_warehouse
-
-
-def _resolve_item_warehouse(shopify_item, setting, item_warehouse_map):
-	"""Return the ERPNext warehouse for a Shopify line item.
-
-	Checks the fulfillment-based item_warehouse_map first, then falls back
-	to the default warehouse from Shopify Setting.
-	"""
-	if item_warehouse_map:
-		key = (str(shopify_item.get("product_id")), str(shopify_item.get("variant_id")))
-		warehouse = item_warehouse_map.get(key)
-		if warehouse:
-			return warehouse
+	if shipping_country:
+		for row in setting.get("country_warehouse_mapping") or []:
+			if row.country == shipping_country:
+				return row.warehouse
 
 	return setting.warehouse
 
