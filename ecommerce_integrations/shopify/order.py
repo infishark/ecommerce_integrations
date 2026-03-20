@@ -79,6 +79,17 @@ def create_sales_order(shopify_order, setting, company=None):
 		if customer_id := shopify_order.get("customer", {}).get("id"):
 			customer = frappe.db.get_value("Customer", {CUSTOMER_ID_FIELD: customer_id}, "name")
 
+	# Ensure customer currency matches company currency before creating
+	# any documents.  Shopify customers may have a foreign currency (e.g.
+	# USD from their billing address) that conflicts with the company's
+	# receivable account currency (e.g. CAD), causing validation errors
+	# on both Sales Orders and Sales Invoices.
+	company_currency = frappe.get_cached_value("Company", setting.company, "default_currency")
+	if customer:
+		customer_currency = frappe.db.get_value("Customer", customer, "default_currency")
+		if customer_currency and customer_currency != company_currency:
+			frappe.db.set_value("Customer", customer, "default_currency", company_currency)
+
 	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
 
 	if not so:
@@ -112,6 +123,8 @@ def create_sales_order(shopify_order, setting, company=None):
 				ORDER_ID_FIELD: str(shopify_order.get("id")),
 				ORDER_NUMBER_FIELD: shopify_order.get("name"),
 				"customer": customer,
+				"currency": company_currency,
+				"conversion_rate": 1,
 				"transaction_date": transaction_date,
 				"delivery_date": transaction_date,
 				"company": setting.company,

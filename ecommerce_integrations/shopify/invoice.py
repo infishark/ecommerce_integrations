@@ -59,15 +59,12 @@ def create_sales_invoice(shopify_order, setting, so):
 
 
 def _align_invoice_currency(sales_invoice):
-	"""Ensure the invoice currency matches the debit_to account currency.
+	"""Safety net: ensure invoice currency matches the debit_to account.
 
-	When a Shopify customer is created with a foreign currency (e.g. USD),
-	ERPNext's validate() derives that currency from the customer record and
-	sets it on the invoice.  However, the debit_to (receivable) account may
-	be in the company's default currency (e.g. CAD), causing a validation
-	error.  Fix this at the source by aligning the customer's
-	default_currency with the company currency so ERPNext resolves both
-	fields consistently during validation.
+	The primary fix is in create_sales_order (order.py) which aligns the
+	customer's default_currency before any documents are created.  This
+	function acts as a fallback in case the invoice still ends up with a
+	mismatched currency.
 	"""
 	if not sales_invoice.debit_to:
 		return
@@ -76,9 +73,6 @@ def _align_invoice_currency(sales_invoice):
 		"Account", sales_invoice.debit_to, "account_currency"
 	)
 	if debit_to_currency and sales_invoice.currency != debit_to_currency:
-		frappe.db.set_value(
-			"Customer", sales_invoice.customer, "default_currency", debit_to_currency
-		)
 		sales_invoice.currency = debit_to_currency
 		sales_invoice.conversion_rate = 1
 
