@@ -93,11 +93,14 @@ def create_sales_order(shopify_order, setting, company=None):
 	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
 
 	if not so:
+		item_warehouse_map = _build_item_warehouse_map(shopify_order, setting)
+
 		items = get_order_items(
 			shopify_order.get("line_items"),
 			setting,
 			getdate(shopify_order.get("created_at")),
 			taxes_inclusive=shopify_order.get("taxes_included"),
+			item_warehouse_map=item_warehouse_map,
 		)
 
 		if not items:
@@ -160,7 +163,7 @@ def create_sales_order(shopify_order, setting, company=None):
 	return so
 
 
-def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
+def get_order_items(order_items, setting, delivery_date, taxes_inclusive, item_warehouse_map=None):
 	items = []
 	all_product_exists = True
 	product_not_exists = []
@@ -175,6 +178,7 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 
 		if all_product_exists:
 			item_code = get_item_code(shopify_item)
+			warehouse = _resolve_item_warehouse(shopify_item, setting, item_warehouse_map)
 			items.append(
 				{
 					"item_code": item_code,
@@ -183,7 +187,7 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 					"delivery_date": delivery_date,
 					"qty": shopify_item.get("quantity"),
 					"stock_uom": shopify_item.get("uom") or "Nos",
-					"warehouse": setting.warehouse,
+					"warehouse": warehouse,
 					ORDER_ITEM_DISCOUNT_FIELD: (
 						_get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
 					),
@@ -193,6 +197,48 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 			items = []
 
 	return items
+
+
+def _build_item_warehouse_map(shopify_order, setting):
+	"""Build a mapping of (product_id, variant_id) → ERPNext warehouse from fulfillment data.
+
+	Uses the Shopify Warehouse Mapping configured in Shopify Setting to resolve
+	each fulfillment location to an ERPNext warehouse.  Returns an empty dict if
+	there are no fulfillments or no mappings configured.
+	"""
+	fulfillments = shopify_order.get("fulfillments") or []
+	if not fulfillments:
+		return {}
+
+	wh_map = setting.get_integration_to_erpnext_wh_mapping()
+	if not wh_map:
+		return {}
+
+	item_warehouse = {}
+	for fulfillment in fulfillments:
+		location_id = str(fulfillment.get("location_id") or "")
+		warehouse = wh_map.get(location_id)
+		if warehouse:
+			for item in fulfillment.get("line_items") or []:
+				key = (str(item.get("product_id")), str(item.get("variant_id")))
+				item_warehouse[key] = warehouse
+
+	return item_warehouse
+
+
+def _resolve_item_warehouse(shopify_item, setting, item_warehouse_map):
+	"""Return the ERPNext warehouse for a Shopify line item.
+
+	Checks the fulfillment-based item_warehouse_map first, then falls back
+	to the default warehouse from Shopify Setting.
+	"""
+	if item_warehouse_map:
+		key = (str(shopify_item.get("product_id")), str(shopify_item.get("variant_id")))
+		warehouse = item_warehouse_map.get(key)
+		if warehouse:
+			return warehouse
+
+	return setting.warehouse
 
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:
@@ -337,7 +383,7 @@ def update_taxes_with_shipping_lines(taxes, shipping_lines, setting, items, taxe
 						"delivery_date": items[-1]["delivery_date"] if items else nowdate(),
 						"qty": 1,
 						"stock_uom": "Nos",
-						"warehouse": setting.warehouse,
+						"warehouse": items[-1]["warehouse"] if items else setting.warehouse,
 					}
 				)
 			else:
