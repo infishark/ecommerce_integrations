@@ -93,7 +93,7 @@ def create_sales_order(shopify_order, setting, company=None):
 	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
 
 	if not so:
-		warehouse = _resolve_order_warehouse(shopify_order, setting)
+		warehouse, wh_exception = _resolve_order_warehouse(shopify_order, setting)
 
 		items = get_order_items(
 			shopify_order.get("line_items"),
@@ -154,6 +154,9 @@ def create_sales_order(shopify_order, setting, company=None):
 		so.save(ignore_permissions=True)
 		so.submit()
 
+		if wh_exception:
+			so.add_comment(text=f"Warehouse Exception: {wh_exception}")
+
 		if shopify_order.get("note"):
 			so.add_comment(text=f"Order Note: {shopify_order.get('note')}")
 
@@ -201,11 +204,34 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 
 
 def _resolve_order_warehouse(shopify_order, setting):
-	"""Resolve the ERPNext warehouse for a Shopify order based on shipping country.
+	"""Resolve the ERPNext warehouse for a Shopify order.
 
-	Looks up the order's shipping country in the Country Warehouse Mapping
-	table on Shopify Setting.  Falls back to the default warehouse.
+	Priority:
+	  1. Fulfillment location (via Shopify Warehouse Mapping) — overrides country rule
+	  2. Shipping country (via Country Warehouse Mapping)
+	  3. Default warehouse
+
+	Returns (warehouse, exception_message).  exception_message is set when the
+	fulfillment location overrides the country-based warehouse so the caller
+	can flag the order for review.
 	"""
+	country_warehouse = _get_country_warehouse(shopify_order, setting)
+	fulfillment_warehouse = _get_fulfillment_warehouse(shopify_order, setting)
+
+	if fulfillment_warehouse and country_warehouse and fulfillment_warehouse != country_warehouse:
+		shipping_country = (shopify_order.get("shipping_address") or {}).get("country", "unknown")
+		exception = (
+			f"Ships to {shipping_country} (normally {country_warehouse}) "
+			f"but fulfilled from {fulfillment_warehouse}"
+		)
+		return fulfillment_warehouse, exception
+
+	warehouse = fulfillment_warehouse or country_warehouse or setting.warehouse
+	return warehouse, None
+
+
+def _get_country_warehouse(shopify_order, setting):
+	"""Look up warehouse from the Country Warehouse Mapping table."""
 	shipping_address = shopify_order.get("shipping_address") or {}
 	shipping_country = shipping_address.get("country")
 
@@ -214,7 +240,21 @@ def _resolve_order_warehouse(shopify_order, setting):
 			if row.country == shipping_country:
 				return row.warehouse
 
-	return setting.warehouse
+	return None
+
+
+def _get_fulfillment_warehouse(shopify_order, setting):
+	"""Look up warehouse from the first fulfillment's location via Shopify Warehouse Mapping."""
+	fulfillments = shopify_order.get("fulfillments") or []
+	if not fulfillments:
+		return None
+
+	wh_map = setting.get_integration_to_erpnext_wh_mapping()
+	if not wh_map:
+		return None
+
+	location_id = str(fulfillments[0].get("location_id") or "")
+	return wh_map.get(location_id)
 
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:
