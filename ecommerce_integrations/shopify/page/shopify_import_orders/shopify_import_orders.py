@@ -7,6 +7,7 @@ from shopify.resources import Order
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import ORDER_ID_FIELD
 from ecommerce_integrations.shopify.order import sync_sales_order
+from ecommerce_integrations.shopify.rate_limit import call_with_rate_limit_retry
 from ecommerce_integrations.shopify.utils import create_shopify_log
 
 # constants
@@ -51,14 +52,14 @@ def fetch_all_orders(from_=None, created_at_min=None, created_at_max=None):
 @temp_shopify_session
 def _fetch_orders_from_shopify(from_=None, created_at_min=None, created_at_max=None, limit=20):
 	if from_:
-		collection = Order.find(from_=from_)
+		collection = call_with_rate_limit_retry(Order.find, kwargs={"from_": from_})
 	else:
 		kwargs = {"limit": limit, "status": "any"}
 		if created_at_min:
 			kwargs["created_at_min"] = get_datetime(created_at_min).astimezone().isoformat()
 		if created_at_max:
 			kwargs["created_at_max"] = get_datetime(created_at_max).astimezone().isoformat()
-		collection = Order.find(**kwargs)
+		collection = call_with_rate_limit_retry(Order.find, kwargs=kwargs)
 
 	return collection
 
@@ -83,7 +84,7 @@ def get_order_count():
 
 @temp_shopify_session
 def get_shopify_order_count():
-	return Order.count(status="any")
+	return call_with_rate_limit_retry(Order.count, kwargs={"status": "any"})
 
 
 @frappe.whitelist()
