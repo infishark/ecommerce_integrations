@@ -1,13 +1,18 @@
+import logging
 from time import process_time
 
 import frappe
 from frappe.utils import cstr, get_datetime
+from pyactiveresource.connection import ClientError, ServerError
 from shopify.resources import Order
 
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import ORDER_ID_FIELD
 from ecommerce_integrations.shopify.order import sync_sales_order
+from ecommerce_integrations.shopify.rate_limit import call_with_rate_limit_retry
 from ecommerce_integrations.shopify.utils import create_shopify_log
+
+logger = logging.getLogger(__name__)
 
 # constants
 SYNC_JOB_NAME = "shopify.job.sync.all.orders"
@@ -49,14 +54,14 @@ def fetch_all_orders(from_=None, created_at_min=None, created_at_max=None):
 @temp_shopify_session
 def _fetch_orders_from_shopify(from_=None, created_at_min=None, created_at_max=None, limit=20):
 	if from_:
-		collection = Order.find(from_=from_)
+		collection = call_with_rate_limit_retry(Order.find, kwargs={"from_": from_})
 	else:
 		kwargs = {"limit": limit, "status": "any"}
 		if created_at_min:
 			kwargs["created_at_min"] = get_datetime(created_at_min).astimezone().isoformat()
 		if created_at_max:
 			kwargs["created_at_max"] = get_datetime(created_at_max).astimezone().isoformat()
-		collection = Order.find(**kwargs)
+		collection = call_with_rate_limit_retry(Order.find, kwargs=kwargs)
 
 	return collection
 
@@ -81,7 +86,7 @@ def get_order_count():
 
 @temp_shopify_session
 def get_shopify_order_count():
-	return Order.count(status="any")
+	return call_with_rate_limit_retry(Order.count, kwargs={"status": "any"})
 
 
 @frappe.whitelist()
@@ -145,13 +150,20 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 
 	publish("Syncing all orders...")
 
-	_sync = True
-	collection = _fetch_orders_from_shopify(
-		created_at_min=created_at_min,
-		created_at_max=created_at_max,
-		limit=50,
-	)
+	try:
+		collection = _fetch_orders_from_shopify(
+			created_at_min=created_at_min,
+			created_at_max=created_at_max,
+			limit=50,
+		)
+	except Exception as e:
+		logger.exception("Failed to fetch orders from Shopify")
+		publish(f"Error fetching orders from Shopify: {e!s}", error=True)
+		publish("Sync aborted.", done=True)
+		return False
+
 	savepoint = "shopify_order_sync"
+	_sync = True
 
 	while _sync:
 		for order in collection:
@@ -182,11 +194,17 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 				frappe.db.rollback(save_point=savepoint)
 				continue
 
-		if collection.has_next_page():
-			frappe.db.commit()
-			collection = _fetch_orders_from_shopify(from_=collection.next_page_url)
-		else:
-			_sync = False
+		try:
+			if collection.has_next_page():
+				frappe.db.commit()
+				collection = _fetch_orders_from_shopify(from_=collection.next_page_url)
+			else:
+				_sync = False
+		except Exception as e:
+			logger.exception("Failed to fetch next page of orders from Shopify")
+			publish(f"Error fetching next page: {e!s}", error=True)
+			publish("Sync stopped (partial). Re-run to continue from where you left off.", done=True)
+			return False
 
 	end_time = process_time()
 	publish(f"Done in {end_time - start_time:.1f}s", done=True)

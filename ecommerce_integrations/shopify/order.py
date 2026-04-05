@@ -8,6 +8,7 @@ from shopify.collection import PaginatedIterator
 from shopify.resources import Order
 
 from ecommerce_integrations.shopify.connection import temp_shopify_session
+from ecommerce_integrations.shopify.rate_limit import call_with_rate_limit_retry
 from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
@@ -436,7 +437,10 @@ def _fetch_old_orders(from_time, to_time):
 	from_time = get_datetime(from_time).astimezone().isoformat()
 	to_time = get_datetime(to_time).astimezone().isoformat()
 	orders_iterator = PaginatedIterator(
-		Order.find(created_at_min=from_time, created_at_max=to_time, limit=250)
+		call_with_rate_limit_retry(
+			Order.find,
+			kwargs={"created_at_min": from_time, "created_at_max": to_time, "limit": 250},
+		)
 	)
 
 	for orders in orders_iterator:
