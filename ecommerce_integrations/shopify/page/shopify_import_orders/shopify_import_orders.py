@@ -160,10 +160,12 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 			WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''"""
 		)
 	)
+	publish(f"Found {len(synced_ids)} already-synced order IDs in ERPNext.")
 
 	# Fetch from Shopify in large batches (250 = Shopify API max)
 	orders_to_sync = []
 	skipped = 0
+	page_num = 1
 	collection = _fetch_orders_from_shopify(
 		created_at_min=created_at_min,
 		created_at_max=created_at_max,
@@ -172,14 +174,22 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 
 	_fetching = True
 	while _fetching:
+		page_count = 0
 		for order in collection:
 			order_dict = order.to_dict()
+			page_count += 1
 			if str(order_dict.get("id")) in synced_ids:
 				skipped += 1
 				continue
 			orders_to_sync.append(order_dict)
 
+		publish(
+			f"Page {page_num}: fetched {page_count} orders "
+			f"({len(orders_to_sync)} to sync, {skipped} skipped so far)"
+		)
+
 		if collection.has_next_page():
+			page_num += 1
 			collection = _fetch_orders_from_shopify(from_=collection.next_page_url)
 		else:
 			_fetching = False
