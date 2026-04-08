@@ -106,16 +106,10 @@ def create_sales_order(shopify_order, setting, company=None):
 		)
 
 		if not items:
-			message = (
-				"Following items exists in the shopify order but relevant records were"
-				" not found in the shopify Product master"
+			frappe.throw(
+				f"No syncable items in Shopify order {shopify_order.get('name')} "
+				f"(all items are custom line items or deleted products)"
 			)
-			product_not_exists = []  # TODO: fix missing items
-			message += "\n" + ", ".join(product_not_exists)
-
-			create_shopify_log(status="Error", exception=message, rollback=True)
-
-			return ""
 
 		taxes = get_order_taxes(shopify_order, setting, items)
 
@@ -154,18 +148,25 @@ def create_sales_order(shopify_order, setting, company=None):
 		so.flags.ignore_mandatory = True
 		so.flags.ignore_validate = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
-		so.save(ignore_permissions=True)
 
+		# Bypass UOM conversion factor and other validations that fail
+		# on historical orders with misconfigured Item UOM tables.
+		_prev_in_import = frappe.flags.in_import
+		frappe.flags.in_import = True
 		try:
+			so.save(ignore_permissions=True)
 			so.submit()
 		except Exception:
 			# Stock validation or other submit errors (common for historical
 			# orders where stock was consumed long ago). Save as Draft rather
 			# than losing the entire order.
 			frappe.db.rollback()
+			frappe.flags.in_import = True
 			so.docstatus = 0
 			so.save(ignore_permissions=True)
 			so.add_comment(text="Auto-import: submit failed, saved as Draft")
+		finally:
+			frappe.flags.in_import = _prev_in_import
 
 		if wh_exception:
 			so.add_comment(text=f"Warehouse Exception: {wh_exception}")
