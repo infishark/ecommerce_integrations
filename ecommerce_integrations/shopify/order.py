@@ -56,6 +56,7 @@ def sync_sales_order(payload, request_id=None):
 		create_order(order, setting)
 	except Exception as e:
 		create_shopify_log(status="Error", exception=e, rollback=True)
+		raise
 	else:
 		create_shopify_log(status="Success")
 
