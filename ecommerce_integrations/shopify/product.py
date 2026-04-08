@@ -334,7 +334,11 @@ def sync_product_from_webhook(payload, request_id=None):
 def create_items_if_not_exist(order):
 	"""Using shopify order, sync all items that are not already synced."""
 	for item in order.get("line_items", []):
-		product_id = item["product_id"]
+		product_id = item.get("product_id")
+		if not product_id or not item.get("product_exists", True):
+			# Skip custom line items (null product_id) and deleted products
+			continue
+
 		variant_id = item.get("variant_id")
 		sku = item.get("sku")
 		product = ShopifyProduct(product_id, variant_id=variant_id, sku=sku)

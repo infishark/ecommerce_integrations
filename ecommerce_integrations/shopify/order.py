@@ -152,9 +152,20 @@ def create_sales_order(shopify_order, setting, company=None):
 		if company:
 			so.update({"company": company, "status": "Draft"})
 		so.flags.ignore_mandatory = True
+		so.flags.ignore_validate = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
 		so.save(ignore_permissions=True)
-		so.submit()
+
+		try:
+			so.submit()
+		except Exception:
+			# Stock validation or other submit errors (common for historical
+			# orders where stock was consumed long ago). Save as Draft rather
+			# than losing the entire order.
+			frappe.db.rollback()
+			so.docstatus = 0
+			so.save(ignore_permissions=True)
+			so.add_comment(text="Auto-import: submit failed, saved as Draft")
 
 		if wh_exception:
 			so.add_comment(text=f"Warehouse Exception: {wh_exception}")
@@ -170,37 +181,31 @@ def create_sales_order(shopify_order, setting, company=None):
 
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive, warehouse=None):
 	items = []
-	all_product_exists = True
-	product_not_exists = []
 
 	warehouse = warehouse or setting.warehouse
 
 	for shopify_item in order_items:
-		if not shopify_item.get("product_exists"):
-			all_product_exists = False
-			product_not_exists.append(
-				{"title": shopify_item.get("title"), ORDER_ID_FIELD: shopify_item.get("id")}
-			)
+		if not shopify_item.get("product_exists") or not shopify_item.get("product_id"):
+			# Skip deleted products and custom line items (no product_id)
 			continue
 
-		if all_product_exists:
-			item_code = get_item_code(shopify_item)
-			items.append(
-				{
-					"item_code": item_code,
-					"item_name": shopify_item.get("name"),
-					"rate": _get_item_price(shopify_item, taxes_inclusive),
-					"delivery_date": delivery_date,
-					"qty": shopify_item.get("quantity"),
-					"stock_uom": shopify_item.get("uom") or "Nos",
-					"warehouse": warehouse,
-					ORDER_ITEM_DISCOUNT_FIELD: (
-						_get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
-					),
-				}
-			)
-		else:
-			items = []
+		item_code = get_item_code(shopify_item)
+		if not item_code:
+			continue
+
+		qty = cint(shopify_item.get("quantity")) or 1
+		items.append(
+			{
+				"item_code": item_code,
+				"item_name": shopify_item.get("name"),
+				"rate": _get_item_price(shopify_item, taxes_inclusive),
+				"delivery_date": delivery_date,
+				"qty": qty,
+				"stock_uom": shopify_item.get("uom") or "Nos",
+				"warehouse": warehouse,
+				ORDER_ITEM_DISCOUNT_FIELD: _get_total_discount(shopify_item) / qty,
+			}
+		)
 
 	return items
 
