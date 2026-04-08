@@ -149,24 +149,18 @@ def create_sales_order(shopify_order, setting, company=None):
 		so.flags.ignore_validate = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
 
-		# Bypass UOM conversion factor and other validations that fail
-		# on historical orders with misconfigured Item UOM tables.
-		_prev_in_import = frappe.flags.in_import
-		frappe.flags.in_import = True
+		so.save(ignore_permissions=True)
+
 		try:
-			so.save(ignore_permissions=True)
 			so.submit()
 		except Exception:
 			# Stock validation or other submit errors (common for historical
 			# orders where stock was consumed long ago). Save as Draft rather
 			# than losing the entire order.
 			frappe.db.rollback()
-			frappe.flags.in_import = True
 			so.docstatus = 0
 			so.save(ignore_permissions=True)
 			so.add_comment(text="Auto-import: submit failed, saved as Draft")
-		finally:
-			frappe.flags.in_import = _prev_in_import
 
 		if wh_exception:
 			so.add_comment(text=f"Warehouse Exception: {wh_exception}")
@@ -195,6 +189,8 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 			continue
 
 		qty = cint(shopify_item.get("quantity")) or 1
+		# Use the Item's actual stock UOM so conversion_factor is always 1
+		item_uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
 		items.append(
 			{
 				"item_code": item_code,
@@ -202,6 +198,7 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 				"rate": _get_item_price(shopify_item, taxes_inclusive),
 				"delivery_date": delivery_date,
 				"qty": qty,
+				"uom": item_uom,
 				"warehouse": warehouse,
 				ORDER_ITEM_DISCOUNT_FIELD: _get_total_discount(shopify_item) / qty,
 			}
