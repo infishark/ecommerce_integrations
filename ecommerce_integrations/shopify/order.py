@@ -201,7 +201,9 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 				"rate": _get_item_price(shopify_item, taxes_inclusive),
 				"delivery_date": delivery_date,
 				"qty": qty,
+				"uom": shopify_item.get("uom") or "Nos",
 				"stock_uom": shopify_item.get("uom") or "Nos",
+				"conversion_factor": 1,
 				"warehouse": warehouse,
 				ORDER_ITEM_DISCOUNT_FIELD: _get_total_discount(shopify_item) / qty,
 			}
