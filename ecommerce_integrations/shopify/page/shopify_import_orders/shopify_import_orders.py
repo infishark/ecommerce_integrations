@@ -216,32 +216,41 @@ def queue_sync_all_orders(created_at_min=None, created_at_max=None, **kwargs):
 
 	synced = 0
 	errors = 0
-	savepoint = "shopify_order_sync"
 
 	for idx, order_dict in enumerate(orders_to_sync):
 		order_name = order_dict.get("name", order_dict.get("id"))
+		order_id = cstr(order_dict.get("id"))
 
+		# sync_sales_order handles its own error logging and calls
+		# create_shopify_log internally, which does frappe.db.commit()
+		# on both success and error paths. We don't wrap in try/except
+		# or savepoints because those conflict with the commits inside
+		# create_log.
 		try:
-			frappe.db.savepoint(savepoint)
-			log = create_shopify_log(
-				status="Queued",
-				method="ecommerce_integrations.shopify.order.sync_sales_order",
-				request_data=order_dict,
-				make_new=True,
-			)
-			sync_sales_order(order_dict, request_id=log.name)
+			sync_sales_order(order_dict)
+		except Exception:
+			# sync_sales_order catches all exceptions internally, so this
+			# only fires if create_shopify_log itself throws (meta-failure).
+			pass
+
+		# Force an explicit commit after every order — belt and suspenders
+		# in case create_log's internal commit didn't persist.
+		try:
+			frappe.db.commit()
+		except Exception:
+			frappe.db.rollback()
+
+		# Verify the order actually persisted by checking the DB.
+		# This catches silent rollbacks, failed submits, and any other
+		# scenario where sync_sales_order reported success but the SO
+		# didn't actually land.
+		if frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: order_id}):
 			synced += 1
 			publish(f"Synced Order {order_name} ({synced}/{total})", synced=True)
-		except Exception as e:
-			frappe.db.rollback(save_point=savepoint)
+		else:
 			errors += 1
-			publish(f"Error syncing Order {order_name}: {e!s}", error=True)
+			publish(f"Failed Order {order_name} — not found in ERPNext ({errors} errors)", error=True)
 
-		# Commit periodically to save progress and free DB locks
-		if (idx + 1) % 10 == 0:
-			frappe.db.commit()
-
-	frappe.db.commit()
 	elapsed = time.time() - start_time
 	publish(f"Done in {elapsed:.1f}s — {synced} synced, {errors} errors", done=True)
 	frappe.cache.delete_value(SYNC_PROGRESS_KEY)
