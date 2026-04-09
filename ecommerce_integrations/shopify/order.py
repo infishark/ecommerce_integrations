@@ -148,18 +148,37 @@ def create_sales_order(shopify_order, setting, company=None):
 		so.flags.ignore_mandatory = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
 
-		so.save(ignore_permissions=True)
+		# Detect historical orders — created more than 30 days ago.
+		# For these we skip submit to avoid ERPNext's stock reservation
+		# validation failing on items whose stock was consumed long ago.
+		from datetime import datetime, timedelta
 
-		try:
-			so.submit()
-		except Exception:
-			# Stock validation or other submit errors (common for historical
-			# orders where stock was consumed long ago). Save as Draft rather
-			# than losing the entire order.
-			frappe.db.rollback()
-			so.docstatus = 0
-			so.save(ignore_permissions=True)
-			so.add_comment(text="Auto-import: submit failed, saved as Draft")
+		is_historical = False
+		if transaction_date:
+			try:
+				age = (datetime.now().date() - transaction_date).days
+				is_historical = age > 30
+			except Exception:
+				pass
+
+		so.save(ignore_permissions=True)
+		# Commit the save immediately so if the submit fails, the Draft
+		# SO persists (otherwise frappe.db.rollback on exception nukes it).
+		frappe.db.commit()
+
+		if is_historical:
+			so.add_comment(text=f"Auto-import: historical order ({age} days old), left as Draft")
+		else:
+			try:
+				so.submit()
+			except Exception as e:
+				# Submit failed (usually stock reservation for historical
+				# orders). The save is already committed, so just note the
+				# reason and leave as Draft.
+				so.add_comment(
+					text=f"Auto-import: submit failed, left as Draft. Reason: {str(e)[:200]}"
+				)
+				frappe.db.commit()
 
 		if wh_exception:
 			so.add_comment(text=f"Warehouse Exception: {wh_exception}")
