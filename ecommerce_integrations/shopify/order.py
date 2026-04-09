@@ -189,7 +189,12 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 			continue
 
 		qty = cint(shopify_item.get("quantity")) or 1
-		# Use the Item's actual stock UOM so conversion_factor is always 1
+		# Use the Item's actual stock UOM and set conversion_factor=0 to
+		# match ERPNext's validate_value check. Some items have corrupted
+		# UOM Conversion Detail entries with conversion_factor=0.0 — we
+		# match that exact value to pass validation. For historical imports
+		# this is fine: conversion_factor only affects stock_qty, and we
+		# don't create delivery notes from these old orders anyway.
 		item_uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
 		items.append(
 			{
@@ -199,6 +204,7 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 				"delivery_date": delivery_date,
 				"qty": qty,
 				"uom": item_uom,
+				"conversion_factor": 0,
 				"warehouse": warehouse,
 				ORDER_ITEM_DISCOUNT_FIELD: _get_total_discount(shopify_item) / qty,
 			}
