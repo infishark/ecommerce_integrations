@@ -168,20 +168,28 @@ def create_sales_order(shopify_order, setting, company=None):
 			so.add_comment(text=f"Order Note: {shopify_order.get('note')}")
 
 	else:
+		# Repair stale SO items from earlier broken syncs — direct SQL
+		# with explicit commit to guarantee persistence before
+		# make_sales_invoice runs. validate_with_previous_doc in the
+		# downstream Sales Invoice compares conversion_factor and stock_qty
+		# between SI and SO items; if the stored SO values are 0, the SI
+		# creation will fail.
+		frappe.db.sql(
+			"""
+			UPDATE `tabSales Order Item` soi
+			INNER JOIN `tabSales Order` so ON soi.parent = so.name
+			SET
+				soi.conversion_factor = 1,
+				soi.stock_uom = (SELECT stock_uom FROM `tabItem` WHERE name = soi.item_code),
+				soi.uom = COALESCE(NULLIF(soi.uom, ''), (SELECT stock_uom FROM `tabItem` WHERE name = soi.item_code)),
+				soi.stock_qty = soi.qty
+			WHERE so.name = %s
+				AND (soi.conversion_factor IS NULL OR soi.conversion_factor = 0 OR soi.stock_qty IS NULL OR soi.stock_qty = 0)
+			""",
+			(so,),
+		)
+		frappe.db.commit()
 		so = frappe.get_doc("Sales Order", so)
-		# Repair stale SO items that were created with conversion_factor=0
-		# from an earlier broken sync. This prevents Sales Invoice creation
-		# from failing validate_with_previous_doc.
-		_repaired = False
-		for item in so.items:
-			if not item.conversion_factor:
-				item.db_set("conversion_factor", 1, update_modified=False)
-				_repaired = True
-			if not item.stock_qty:
-				item.db_set("stock_qty", item.qty, update_modified=False)
-				_repaired = True
-		if _repaired:
-			so.reload()
 
 	return so
 
@@ -201,11 +209,12 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 			continue
 
 		qty = cint(shopify_item.get("quantity")) or 1
-		# Use the Item's actual stock UOM so ERPNext auto-fills
-		# conversion_factor to 1. This matches what the downstream Sales
-		# Invoice will auto-fill (via set_missing_item_details), so
-		# validate_with_previous_doc's compare_values check passes.
-		item_uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
+		# Don't set uom/stock_uom/conversion_factor — let ERPNext
+		# auto-populate them from the Item master via set_missing_item_details.
+		# stock_uom and conversion_factor are read_only=1 on Sales Order Item,
+		# and setting uom explicitly triggers a different lookup path that
+		# queries the Item's UOM Conversion Detail table (which has corrupted
+		# 0.0 entries for some items).
 		items.append(
 			{
 				"item_code": item_code,
@@ -213,7 +222,6 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive, wareho
 				"rate": _get_item_price(shopify_item, taxes_inclusive),
 				"delivery_date": delivery_date,
 				"qty": qty,
-				"uom": item_uom,
 				"warehouse": warehouse,
 				ORDER_ITEM_DISCOUNT_FIELD: _get_total_discount(shopify_item) / qty,
 			}
