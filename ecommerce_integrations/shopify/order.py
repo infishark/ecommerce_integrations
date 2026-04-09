@@ -146,7 +146,6 @@ def create_sales_order(shopify_order, setting, company=None):
 		if company:
 			so.update({"company": company, "status": "Draft"})
 		so.flags.ignore_mandatory = True
-		so.flags.ignore_validate = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
 
 		so.save(ignore_permissions=True)
@@ -170,6 +169,19 @@ def create_sales_order(shopify_order, setting, company=None):
 
 	else:
 		so = frappe.get_doc("Sales Order", so)
+		# Repair stale SO items that were created with conversion_factor=0
+		# from an earlier broken sync. This prevents Sales Invoice creation
+		# from failing validate_with_previous_doc.
+		_repaired = False
+		for item in so.items:
+			if not item.conversion_factor:
+				item.db_set("conversion_factor", 1, update_modified=False)
+				_repaired = True
+			if not item.stock_qty:
+				item.db_set("stock_qty", item.qty, update_modified=False)
+				_repaired = True
+		if _repaired:
+			so.reload()
 
 	return so
 
