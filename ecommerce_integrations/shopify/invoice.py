@@ -47,6 +47,7 @@ def create_sales_invoice(shopify_order, setting, so):
 		sales_invoice.due_date = posting_date
 		sales_invoice.naming_series = setting.sales_invoice_series or "SI-Shopify-"
 		sales_invoice.flags.ignore_mandatory = True
+		_ensure_debit_to_account(sales_invoice, setting)
 		_align_invoice_currency(sales_invoice)
 		set_cost_center(sales_invoice.items, setting.cost_center)
 		sales_invoice.insert(ignore_mandatory=True)
@@ -56,6 +57,38 @@ def create_sales_invoice(shopify_order, setting, so):
 
 		if shopify_order.get("note"):
 			sales_invoice.add_comment(text=f"Order Note: {shopify_order.get('note')}")
+
+
+def _ensure_debit_to_account(sales_invoice, setting):
+	"""Ensure the Sales Invoice has a debit_to receivable account.
+
+	New customers created during Shopify sync don't have an entry in
+	their 'accounts' child table (currency-specific receivable), and
+	the Company may not have default_receivable_account set. Look up
+	the first suitable receivable account for the company and set it.
+	"""
+	if sales_invoice.debit_to:
+		return
+
+	company = sales_invoice.company or setting.company
+
+	# 1. Try Company's default_receivable_account
+	debit_to = frappe.get_cached_value("Company", company, "default_receivable_account")
+
+	# 2. Fall back to any non-group Receivable account for the company
+	if not debit_to:
+		debit_to = frappe.db.get_value(
+			"Account",
+			{
+				"company": company,
+				"account_type": "Receivable",
+				"is_group": 0,
+			},
+			"name",
+		)
+
+	if debit_to:
+		sales_invoice.debit_to = debit_to
 
 
 def _align_invoice_currency(sales_invoice):
