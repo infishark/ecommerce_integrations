@@ -315,13 +315,51 @@ def cancel_shopify_documents(dry_run="1"):
 	if dry_run:
 		report["message"] = (
 			"DRY RUN — no changes made. "
-			"Call with ?dry_run=0 to execute cancellation."
+			"Call with ?dry_run=0 to execute cancellation as a background job."
 		)
 		return report
 
-	# ── REAL EXECUTION ────────────────────────────────────────────
-	cancelled = {"pe": 0, "si": 0, "dn": 0, "so": 0}
-	errors = []
+	# ── REAL EXECUTION — enqueue as background job ────────────────
+	frappe.enqueue(
+		_run_cancellation,
+		queue="long",
+		timeout=7200,  # 2 hours
+		pe_names=pe_names,
+		si_names=si_names,
+		dn_names=dn_names,
+		so_names=so_names,
+	)
+
+	report["message"] = (
+		"Cancellation job enqueued. This will take 30-60 minutes. "
+		"Check progress at: /api/method/ecommerce_integrations.shopify.diagnostics.cancel_progress"
+	)
+	return report
+
+
+CANCEL_PROGRESS_KEY = "shopify_cancel_progress"
+
+
+@frappe.whitelist()
+def cancel_progress():
+	"""Check the progress of a running cancellation job."""
+	frappe.only_for("System Manager")
+	progress = frappe.cache.get_value(CANCEL_PROGRESS_KEY)
+	if not progress:
+		return {"status": "no job running or completed"}
+	return progress
+
+
+def _run_cancellation(pe_names, si_names, dn_names, so_names):
+	"""Background job: cancel all Shopify documents in dependency order."""
+	progress = {
+		"status": "running",
+		"phase": "starting",
+		"cancelled": {"pe": 0, "si": 0, "dn": 0, "so": 0},
+		"errors": [],
+		"total": len(pe_names) + len(si_names) + len(dn_names) + len(so_names),
+	}
+	frappe.cache.set_value(CANCEL_PROGRESS_KEY, progress, expires_in_sec=14400)
 
 	def _cancel_doc(doctype, name):
 		try:
@@ -331,45 +369,28 @@ def cancel_shopify_documents(dry_run="1"):
 				doc.cancel()
 			return True
 		except Exception as e:
-			errors.append({"doctype": doctype, "name": name, "error": str(e)[:200]})
+			if len(progress["errors"]) < 50:
+				progress["errors"].append({"doctype": doctype, "name": name, "error": str(e)[:200]})
 			frappe.db.rollback()
 			return False
 
-	# Cancel Payment Entries first
-	for name in pe_names:
-		if _cancel_doc("Payment Entry", name):
-			cancelled["pe"] += 1
-		if cancelled["pe"] % 50 == 0:
-			frappe.db.commit()
-	frappe.db.commit()
+	def _cancel_batch(doctype, names, key):
+		progress["phase"] = f"Cancelling {doctype}s ({len(names)})"
+		frappe.cache.set_value(CANCEL_PROGRESS_KEY, progress, expires_in_sec=14400)
 
-	# Cancel Sales Invoices
-	for name in si_names:
-		if _cancel_doc("Sales Invoice", name):
-			cancelled["si"] += 1
-		if cancelled["si"] % 50 == 0:
-			frappe.db.commit()
-	frappe.db.commit()
+		for i, name in enumerate(names):
+			if _cancel_doc(doctype, name):
+				progress["cancelled"][key] += 1
+			if (i + 1) % 20 == 0:
+				frappe.db.commit()
+				frappe.cache.set_value(CANCEL_PROGRESS_KEY, progress, expires_in_sec=14400)
+		frappe.db.commit()
 
-	# Cancel Delivery Notes
-	for name in dn_names:
-		if _cancel_doc("Delivery Note", name):
-			cancelled["dn"] += 1
-		if cancelled["dn"] % 50 == 0:
-			frappe.db.commit()
-	frappe.db.commit()
+	_cancel_batch("Payment Entry", pe_names, "pe")
+	_cancel_batch("Sales Invoice", si_names, "si")
+	_cancel_batch("Delivery Note", dn_names, "dn")
+	_cancel_batch("Sales Order", so_names, "so")
 
-	# Cancel Sales Orders
-	for name in so_names:
-		if _cancel_doc("Sales Order", name):
-			cancelled["so"] += 1
-		if cancelled["so"] % 50 == 0:
-			frappe.db.commit()
-	frappe.db.commit()
-
-	report["cancelled"] = cancelled
-	report["errors"] = errors[:50]  # Cap at 50 to keep response manageable
-	report["total_errors"] = len(errors)
-	report["message"] = "Cancellation complete."
-
-	return report
+	progress["status"] = "completed"
+	progress["phase"] = "done"
+	frappe.cache.set_value(CANCEL_PROGRESS_KEY, progress, expires_in_sec=14400)
