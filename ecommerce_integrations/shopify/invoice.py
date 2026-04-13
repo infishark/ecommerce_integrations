@@ -32,7 +32,9 @@ def prepare_sales_invoice(payload, request_id=None):
 
 def create_sales_invoice(shopify_order, setting, so):
 	if (
-		not frappe.db.get_value("Sales Invoice", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
+		not frappe.db.get_value(
+			"Sales Invoice", {ORDER_ID_FIELD: shopify_order.get("id"), "docstatus": ["!=", 2]}, "name"
+		)
 		and so.docstatus == 1
 		and not so.per_billed
 		and cint(setting.sync_sales_invoice)
@@ -60,22 +62,44 @@ def create_sales_invoice(shopify_order, setting, so):
 
 
 def _ensure_debit_to_account(sales_invoice, setting):
-	"""Ensure the Sales Invoice has a debit_to receivable account.
+	"""Ensure the Sales Invoice has a debit_to receivable account
+	whose account_currency matches the invoice currency.
 
 	New customers created during Shopify sync don't have an entry in
 	their 'accounts' child table (currency-specific receivable), and
-	the Company may not have default_receivable_account set. Look up
-	the first suitable receivable account for the company and set it.
+	the Company may not have default_receivable_account set.
+
+	For multi-currency support (e.g. USD orders on a CAD company), we
+	look up a receivable account that matches the invoice's currency.
 	"""
-	if sales_invoice.debit_to:
-		return
-
 	company = sales_invoice.company or setting.company
+	invoice_currency = sales_invoice.currency
 
-	# 1. Try Company's default_receivable_account
-	debit_to = frappe.get_cached_value("Company", company, "default_receivable_account")
+	# If debit_to is set, verify its currency matches the invoice
+	if sales_invoice.debit_to:
+		account_currency = frappe.get_cached_value(
+			"Account", sales_invoice.debit_to, "account_currency"
+		)
+		if account_currency == invoice_currency:
+			return  # Already correct
 
-	# 2. Fall back to any non-group Receivable account for the company
+	# Find a receivable account matching the invoice currency
+	debit_to = frappe.db.get_value(
+		"Account",
+		{
+			"company": company,
+			"account_type": "Receivable",
+			"account_currency": invoice_currency,
+			"is_group": 0,
+		},
+		"name",
+	)
+
+	# Fall back to company default (may be wrong currency, but better than nothing)
+	if not debit_to:
+		debit_to = frappe.get_cached_value("Company", company, "default_receivable_account")
+
+	# Last resort: any receivable account
 	if not debit_to:
 		debit_to = frappe.db.get_value(
 			"Account",

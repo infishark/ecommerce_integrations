@@ -35,7 +35,7 @@ def sync_sales_order(payload, request_id=None):
 	frappe.set_user("Administrator")
 	frappe.flags.request_id = request_id
 
-	if frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: cstr(order["id"])}):
+	if frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: cstr(order["id"]), "docstatus": ["!=", 2]}):
 		create_shopify_log(status="Invalid", message="Sales order already exists, not synced")
 		return
 	try:
@@ -81,18 +81,21 @@ def create_sales_order(shopify_order, setting, company=None):
 		if customer_id := shopify_order.get("customer", {}).get("id"):
 			customer = frappe.db.get_value("Customer", {CUSTOMER_ID_FIELD: customer_id}, "name")
 
-	# Ensure customer currency matches company currency before creating
-	# any documents.  Shopify customers may have a foreign currency (e.g.
-	# USD from their billing address) that conflicts with the company's
-	# receivable account currency (e.g. CAD), causing validation errors
-	# on both Sales Orders and Sales Invoices.
 	company_currency = frappe.get_cached_value("Company", setting.company, "default_currency")
+	order_currency = shopify_order.get("currency") or company_currency
+
+	# Set the customer's default_currency to match the order currency so
+	# ERPNext doesn't reject the Sales Order / Sales Invoice for currency
+	# mismatch. This is safe because the customer was created from Shopify
+	# and should match the order's transacting currency.
 	if customer:
 		customer_currency = frappe.db.get_value("Customer", customer, "default_currency")
-		if customer_currency and customer_currency != company_currency:
-			frappe.db.set_value("Customer", customer, "default_currency", company_currency)
+		if customer_currency != order_currency:
+			frappe.db.set_value("Customer", customer, "default_currency", order_currency)
 
-	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
+	so = frappe.db.get_value(
+		"Sales Order", {ORDER_ID_FIELD: shopify_order.get("id"), "docstatus": ["!=", 2]}, "name"
+	)
 
 	if not so:
 		warehouse, wh_exception = _resolve_order_warehouse(shopify_order, setting)
@@ -122,7 +125,7 @@ def create_sales_order(shopify_order, setting, company=None):
 				ORDER_ID_FIELD: str(shopify_order.get("id")),
 				ORDER_NUMBER_FIELD: shopify_order.get("name"),
 				"customer": customer,
-				"currency": company_currency,
+				"currency": order_currency,
 				"conversion_rate": 1,
 				"transaction_date": transaction_date,
 				"delivery_date": transaction_date,
@@ -483,7 +486,9 @@ def update_taxes_with_shipping_lines(taxes, shipping_lines, setting, items, taxe
 
 def get_sales_order(order_id):
 	"""Get ERPNext sales order using shopify order id."""
-	sales_order = frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: order_id})
+	sales_order = frappe.db.get_value(
+		"Sales Order", filters={ORDER_ID_FIELD: order_id, "docstatus": ["!=", 2]}
+	)
 	if sales_order:
 		return frappe.get_doc("Sales Order", sales_order)
 

@@ -232,3 +232,144 @@ def _find_all_links_to_so(so_name: str) -> dict:
 		links["gl_entry_count_error"] = str(e)
 
 	return links
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Mass cancellation for currency revert
+# ════════════════════════════════════════════════════════════════════
+
+@frappe.whitelist()
+def cancel_shopify_documents(dry_run="1"):
+	"""Cancel all Shopify-synced documents so they can be re-synced with
+	correct currency.
+
+	Cancellation order: Payment Entry → Sales Invoice → Delivery Note → Sales Order.
+
+	Args:
+		dry_run: "1" (default) to only report what WOULD be cancelled.
+		         "0" to actually cancel.
+
+	Call via:
+		/api/method/ecommerce_integrations.shopify.diagnostics.cancel_shopify_documents
+		/api/method/ecommerce_integrations.shopify.diagnostics.cancel_shopify_documents?dry_run=0
+	"""
+	frappe.only_for("System Manager")
+	dry_run = dry_run != "0"
+
+	report = {"dry_run": dry_run}
+
+	# ── 1. Find all Shopify-synced Sales Orders (non-cancelled) ───
+	shopify_sos = frappe.db.sql(
+		f"""SELECT name, docstatus FROM `tabSales Order`
+		WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''
+			AND docstatus != 2""",
+		as_dict=True,
+	)
+	so_names = [r["name"] for r in shopify_sos]
+	report["sales_orders_to_cancel"] = len(so_names)
+
+	if not so_names:
+		report["message"] = "No Shopify Sales Orders to cancel."
+		return report
+
+	# ── 2. Find linked Sales Invoices (non-cancelled) ─────────────
+	shopify_sis = frappe.db.sql(
+		f"""SELECT name, docstatus FROM `tabSales Invoice`
+		WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''
+			AND docstatus != 2""",
+		as_dict=True,
+	)
+	si_names = [r["name"] for r in shopify_sis]
+	report["sales_invoices_to_cancel"] = len(si_names)
+
+	# ── 3. Find linked Payment Entries (non-cancelled) ────────────
+	pe_names = []
+	if si_names:
+		pe_rows = frappe.db.sql(
+			"""SELECT DISTINCT pe.name, pe.docstatus
+			FROM `tabPayment Entry` pe
+			INNER JOIN `tabPayment Entry Reference` per ON per.parent = pe.name
+			WHERE per.reference_doctype = 'Sales Invoice'
+				AND per.reference_name IN %s
+				AND pe.docstatus != 2""",
+			(si_names,),
+			as_dict=True,
+		)
+		pe_names = [r["name"] for r in pe_rows]
+	report["payment_entries_to_cancel"] = len(pe_names)
+
+	# ── 4. Find linked Delivery Notes (non-cancelled) ────────────
+	shopify_dns = frappe.db.sql(
+		f"""SELECT name, docstatus FROM `tabDelivery Note`
+		WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''
+			AND docstatus != 2""",
+		as_dict=True,
+	)
+	dn_names = [r["name"] for r in shopify_dns]
+	report["delivery_notes_to_cancel"] = len(dn_names)
+
+	report["total_documents"] = (
+		len(pe_names) + len(si_names) + len(dn_names) + len(so_names)
+	)
+
+	if dry_run:
+		report["message"] = (
+			"DRY RUN — no changes made. "
+			"Call with ?dry_run=0 to execute cancellation."
+		)
+		return report
+
+	# ── REAL EXECUTION ────────────────────────────────────────────
+	cancelled = {"pe": 0, "si": 0, "dn": 0, "so": 0}
+	errors = []
+
+	def _cancel_doc(doctype, name):
+		try:
+			doc = frappe.get_doc(doctype, name)
+			if doc.docstatus == 1:
+				doc.flags.ignore_permissions = True
+				doc.cancel()
+			return True
+		except Exception as e:
+			errors.append({"doctype": doctype, "name": name, "error": str(e)[:200]})
+			frappe.db.rollback()
+			return False
+
+	# Cancel Payment Entries first
+	for name in pe_names:
+		if _cancel_doc("Payment Entry", name):
+			cancelled["pe"] += 1
+		if cancelled["pe"] % 50 == 0:
+			frappe.db.commit()
+	frappe.db.commit()
+
+	# Cancel Sales Invoices
+	for name in si_names:
+		if _cancel_doc("Sales Invoice", name):
+			cancelled["si"] += 1
+		if cancelled["si"] % 50 == 0:
+			frappe.db.commit()
+	frappe.db.commit()
+
+	# Cancel Delivery Notes
+	for name in dn_names:
+		if _cancel_doc("Delivery Note", name):
+			cancelled["dn"] += 1
+		if cancelled["dn"] % 50 == 0:
+			frappe.db.commit()
+	frappe.db.commit()
+
+	# Cancel Sales Orders
+	for name in so_names:
+		if _cancel_doc("Sales Order", name):
+			cancelled["so"] += 1
+		if cancelled["so"] % 50 == 0:
+			frappe.db.commit()
+	frappe.db.commit()
+
+	report["cancelled"] = cancelled
+	report["errors"] = errors[:50]  # Cap at 50 to keep response manageable
+	report["total_errors"] = len(errors)
+	report["message"] = "Cancellation complete."
+
+	return report
