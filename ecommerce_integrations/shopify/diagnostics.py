@@ -394,3 +394,130 @@ def _run_cancellation(pe_names, si_names, dn_names, so_names):
 	progress["status"] = "completed"
 	progress["phase"] = "done"
 	frappe.cache.set_value(CANCEL_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+
+@frappe.whitelist()
+def cleanup_blocked_sales_orders():
+	"""Cancel Delivery Notes that block Shopify SO cancellation, then
+	retry cancelling those SOs.
+
+	Some DNs were created outside the Shopify sync (e.g. by ops/ShipHero)
+	and don't have a shopify_order_id. They link to Shopify SOs via
+	Delivery Note Item.against_sales_order, blocking SO cancellation.
+
+	This endpoint:
+	1. Finds all non-cancelled Shopify SOs
+	2. Finds ALL non-cancelled DNs linked to them (regardless of shopify_order_id)
+	3. Cancels those DNs
+	4. Retries cancelling the SOs
+
+	Call: /api/method/ecommerce_integrations.shopify.diagnostics.cleanup_blocked_sales_orders
+	"""
+	frappe.only_for("System Manager")
+
+	# Enqueue as background job
+	frappe.enqueue(
+		_run_cleanup,
+		queue="long",
+		timeout=7200,
+	)
+
+	return {"message": "Cleanup job enqueued. Check progress at cancel_progress endpoint."}
+
+
+CLEANUP_PROGRESS_KEY = "shopify_cleanup_progress"
+
+
+@frappe.whitelist()
+def cleanup_progress():
+	"""Check the progress of the cleanup job."""
+	frappe.only_for("System Manager")
+	progress = frappe.cache.get_value(CLEANUP_PROGRESS_KEY)
+	if not progress:
+		return {"status": "no cleanup job running or completed"}
+	return progress
+
+
+def _run_cleanup():
+	progress = {
+		"status": "running",
+		"phase": "finding blocked SOs",
+		"cancelled_dns": 0,
+		"cancelled_sos": 0,
+		"errors": [],
+	}
+	frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+	# Find non-cancelled Shopify SOs
+	blocked_sos = frappe.db.sql(
+		f"""SELECT name FROM `tabSales Order`
+		WHERE `{ORDER_ID_FIELD}` IS NOT NULL AND `{ORDER_ID_FIELD}` != ''
+			AND docstatus = 1""",
+		as_dict=True,
+	)
+	so_names = [r["name"] for r in blocked_sos]
+
+	if not so_names:
+		progress["status"] = "completed"
+		progress["phase"] = "no blocked SOs found"
+		frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+		return
+
+	progress["phase"] = f"Finding linked DNs for {len(so_names)} SOs"
+	frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+	# Find ALL non-cancelled DNs linked to these SOs via DN Item
+	linked_dns = frappe.db.sql(
+		"""SELECT DISTINCT dni.parent as name
+		FROM `tabDelivery Note Item` dni
+		INNER JOIN `tabDelivery Note` dn ON dn.name = dni.parent
+		WHERE dni.against_sales_order IN %s
+			AND dn.docstatus = 1""",
+		(so_names,),
+		as_dict=True,
+	)
+	dn_names = [r["name"] for r in linked_dns]
+
+	progress["phase"] = f"Cancelling {len(dn_names)} linked DNs"
+	frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+	# Cancel the blocking DNs
+	for i, name in enumerate(dn_names):
+		try:
+			doc = frappe.get_doc("Delivery Note", name)
+			if doc.docstatus == 1:
+				doc.flags.ignore_permissions = True
+				doc.cancel()
+			progress["cancelled_dns"] += 1
+		except Exception as e:
+			if len(progress["errors"]) < 50:
+				progress["errors"].append({"doctype": "Delivery Note", "name": name, "error": str(e)[:200]})
+			frappe.db.rollback()
+		if (i + 1) % 20 == 0:
+			frappe.db.commit()
+			frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+	frappe.db.commit()
+
+	# Now retry cancelling the SOs
+	progress["phase"] = f"Retrying {len(so_names)} SOs"
+	frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+
+	for i, name in enumerate(so_names):
+		try:
+			doc = frappe.get_doc("Sales Order", name)
+			if doc.docstatus == 1:
+				doc.flags.ignore_permissions = True
+				doc.cancel()
+			progress["cancelled_sos"] += 1
+		except Exception as e:
+			if len(progress["errors"]) < 50:
+				progress["errors"].append({"doctype": "Sales Order", "name": name, "error": str(e)[:200]})
+			frappe.db.rollback()
+		if (i + 1) % 20 == 0:
+			frappe.db.commit()
+			frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
+	frappe.db.commit()
+
+	progress["status"] = "completed"
+	progress["phase"] = "done"
+	frappe.cache.set_value(CLEANUP_PROGRESS_KEY, progress, expires_in_sec=14400)
